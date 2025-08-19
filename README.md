@@ -95,7 +95,21 @@ The program includes safety checks with custom error codes, such as:
 - **InvalidSettlementTime**  
 - **WrongSettlementKind**  
 - **AlreadySettled**  
-- **NoSettlementPrice**  
+- **NoSettlementPrice**
+
+  ---
+
+  ### ✨ Recently added features
+- **Dynamic margining** with volatility-based margin requirements.
+- **Multi-collateral support**: Markets can allow multiple collateral mints.
+- **Market pausing/unpausing** for safety.
+- **Deal freezing/unfreezing** for dispute or emergency handling.
+- **Cross-margin vaults** for efficient collateral use.
+- **Yield (strategy operator) support** for idle margin.
+- **Partial physical settlement** of deals.
+- **Comprehensive event emission** for all key actions.
+
+---
 
 
 ---
