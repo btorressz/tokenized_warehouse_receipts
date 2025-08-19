@@ -4,15 +4,35 @@ use anchor_spl::token::{
     self, Burn, Mint, MintTo, SetAuthority, Token, TokenAccount, Transfer,
 };
 
-// Program ID
+// ProgramID
 declare_id!("programid");
 
 // ==========
 // Constants
 // ==========
 const VERSION: u8 = 1;
+const DEAL_VERSION: u8 = 1;
 const BPS_DENOMINATOR: u64 = 10_000;
+const MAX_COLLATERALS: usize = 4;
 
+// ==========
+// Enums
+// ==========
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq)]
+pub enum SettlementKind {
+    Cash = 0,
+    Physical = 1,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Long,
+    Short,
+}
+
+// ==========
+// Program
+// ==========
 #[program]
 pub mod tokenized_warehouse_receipts {
     use super::*;
@@ -22,66 +42,140 @@ pub mod tokenized_warehouse_receipts {
         ctx: Context<InitMarket>,
         fee_bps: u16,
         oracle_authority: Pubkey,
+        governance_authority: Pubkey,
+        base_initial_margin_bps: u16,
+        maintenance_margin_bps: u16,
+        vol_multiplier_bps: u16, // scales how aggressively vol raises required margin
     ) -> Result<()> {
         require!(fee_bps <= 1000, ErrorCode::FeeTooHigh); // <= 10%
         let market = &mut ctx.accounts.market;
         market.version = VERSION;
         market.authority = ctx.accounts.authority.key();
+        market.governance_authority = governance_authority;
         market.quote_mint = ctx.accounts.quote_mint.key();
         market.receipt_mint = ctx.accounts.receipt_mint.key();
         market.oracle_authority = oracle_authority;
         market.fee_bps = fee_bps;
         market.is_paused = false;
         market.last_price = 0;
+        market.last_vol_bps = 0;
         market.price_exponent = -6; // default 6 decimals (e.g., USDC quote)
         market.settle_ts = 0;
+        market.base_initial_margin_bps = base_initial_margin_bps;
+        market.maintenance_margin_bps = maintenance_margin_bps;
+        market.vol_multiplier_bps = vol_multiplier_bps;
+        market.allowed_collaterals = [Pubkey::default(); MAX_COLLATERALS];
+        market.allowed_count = 0;
+        market.strategy_operator = Pubkey::default();
+
+        emit!(MarketInitialized {
+            market: market.key(),
+            authority: market.authority,
+            governance_authority,
+            quote_mint: market.quote_mint,
+            receipt_mint: market.receipt_mint,
+            fee_bps,
+        });
         Ok(())
     }
 
-    /// Oracle or market authority posts a settlement price to be used for cash settlement.
-    pub fn post_price(ctx: Context<PostPrice>, price: u64, exponent: i32, settle_ts: i64) -> Result<()> {
+    /// Allow governance/authority to add an allowed collateral mint (multi-stable support).
+    pub fn add_allowed_collateral(ctx: Context<AdminMarketWrite>, collateral_mint: Pubkey) -> Result<()> {
+        only_admin(&ctx.accounts.market, &ctx.accounts.signer)?;
+        let m = &mut ctx.accounts.market;
+        require!(!m.is_paused, ErrorCode::MarketPaused);
+
+        for i in 0..m.allowed_count as usize {
+            if m.allowed_collaterals[i] == collateral_mint {
+                return Ok(()); // already present
+            }
+        }
+        require!((m.allowed_count as usize) < MAX_COLLATERALS, ErrorCode::TooManyCollaterals);
+        let idx = m.allowed_count as usize;
+        m.allowed_collaterals[idx] = collateral_mint;
+        m.allowed_count += 1;
+        emit!(CollateralAdded { market: m.key(), collateral_mint });
+        Ok(())
+    }
+
+    pub fn remove_allowed_collateral(ctx: Context<AdminMarketWrite>, collateral_mint: Pubkey) -> Result<()> {
+        only_admin(&ctx.accounts.market, &ctx.accounts.signer)?;
+        let m = &mut ctx.accounts.market;
+        require!(!m.is_paused, ErrorCode::MarketPaused);
+
+        let mut idx: Option<usize> = None;
+        for i in 0..m.allowed_count as usize {
+            if m.allowed_collaterals[i] == collateral_mint {
+                idx = Some(i);
+                break;
+            }
+        }
+        require!(idx.is_some(), ErrorCode::CollateralNotFound);
+        let i = idx.unwrap();
+        let last = (m.allowed_count - 1) as usize;
+        m.allowed_collaterals[i] = m.allowed_collaterals[last];
+        m.allowed_collaterals[last] = Pubkey::default();
+        m.allowed_count -= 1;
+        emit!(CollateralRemoved { market: m.key(), collateral_mint });
+        Ok(())
+    }
+
+    pub fn pause_market(ctx: Context<AdminMarketWrite>) -> Result<()> {
+        only_admin(&ctx.accounts.market, &ctx.accounts.signer)?;
+        let m = &mut ctx.accounts.market;
+        m.is_paused = true;
+        emit!(MarketPaused { market: m.key() });
+        Ok(())
+    }
+
+    pub fn unpause_market(ctx: Context<AdminMarketWrite>) -> Result<()> {
+        only_admin(&ctx.accounts.market, &ctx.accounts.signer)?;
+        let m = &mut ctx.accounts.market;
+        m.is_paused = false;
+        emit!(MarketUnpaused { market: m.key() });
+        Ok(())
+    }
+
+    /// Oracle/authority posts price + volatility to drive dynamic margining.
+    pub fn post_price(
+        ctx: Context<PostPrice>,
+        price: u64,
+        exponent: i32,
+        settle_ts: i64,
+        vol_bps: u16,
+    ) -> Result<()> {
         let market = &mut ctx.accounts.market;
-        // Only oracle authority or market authority may post
         let signer = ctx.accounts.poster.key();
         require!(
-            signer == market.oracle_authority || signer == market.authority,
+            signer == market.oracle_authority || signer == market.authority || signer == market.governance_authority,
             ErrorCode::Unauthorized
         );
         market.last_price = price;
         market.price_exponent = exponent;
-        market.settle_ts = settle_ts; // optional: per-market default settlement timestamp
+        market.settle_ts = settle_ts;
+        market.last_vol_bps = vol_bps;
+        emit!(PricePosted {
+            market: market.key(),
+            price,
+            exponent,
+            settle_ts,
+            vol_bps,
+        });
         Ok(())
     }
 
     // --- Warehouse lifecycle ---
-    /// Register a certified warehouse for this market and hand the Mint authority
-    /// of the receipt mint to the program PDA so future `mint_receipt` calls are controlled.
     pub fn init_warehouse(ctx: Context<InitWarehouse>) -> Result<()> {
-        // Manual equality checks (clearer compiler errors vs. has_one attrs)
-        require_keys_eq!(
-            ctx.accounts.market.receipt_mint,
-            ctx.accounts.receipt_mint.key(),
-            ErrorCode::ConstraintMismatch
-        );
-        require_keys_eq!(
-            ctx.accounts.market.quote_mint,
-            ctx.accounts.quote_mint.key(),
-            ErrorCode::ConstraintMismatch
-        );
-        require_keys_eq!(
-            ctx.accounts.market.authority,
-            ctx.accounts.authority.key(),
-            ErrorCode::ConstraintMismatch
-        );
+        require_keys_eq!(ctx.accounts.market.receipt_mint, ctx.accounts.receipt_mint.key(), ErrorCode::ConstraintMismatch);
+        require_keys_eq!(ctx.accounts.market.quote_mint, ctx.accounts.quote_mint.key(), ErrorCode::ConstraintMismatch);
+        require_keys_eq!(ctx.accounts.market.authority, ctx.accounts.authority.key(), ErrorCode::ConstraintMismatch);
 
         let warehouse = &mut ctx.accounts.warehouse;
         warehouse.market = ctx.accounts.market.key();
         warehouse.authority = ctx.accounts.warehouse_authority.key();
         warehouse.receipt_mint = ctx.accounts.receipt_mint.key();
-        // Anchor 0.28+: typed bumps struct
         warehouse.bump = ctx.bumps.receipt_mint_auth;
 
-        // Transfer mint authority to PDA (receipt_mint_auth)
         token::set_authority(
             CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
@@ -94,27 +188,19 @@ pub mod tokenized_warehouse_receipts {
             Some(ctx.accounts.receipt_mint_auth.key()),
         )?;
 
+        emit!(WarehouseInitialized {
+            market: warehouse.market,
+            warehouse: warehouse.key(),
+            warehouse_authority: warehouse.authority,
+            receipt_mint: warehouse.receipt_mint,
+        });
         Ok(())
     }
 
-    /// Mint receipt tokens, callable only by the certified warehouse authority.
     pub fn mint_receipt(ctx: Context<MintReceipt>, amount: u64) -> Result<()> {
-        // Manual equality checks
-        require_keys_eq!(
-            ctx.accounts.warehouse.market,
-            ctx.accounts.market.key(),
-            ErrorCode::ConstraintMismatch
-        );
-        require_keys_eq!(
-            ctx.accounts.warehouse.authority,
-            ctx.accounts.warehouse_authority.key(),
-            ErrorCode::Unauthorized
-        );
-        require_keys_eq!(
-            ctx.accounts.warehouse.receipt_mint,
-            ctx.accounts.receipt_mint.key(),
-            ErrorCode::ConstraintMismatch
-        );
+        require_keys_eq!(ctx.accounts.warehouse.market, ctx.accounts.market.key(), ErrorCode::ConstraintMismatch);
+        require_keys_eq!(ctx.accounts.warehouse.authority, ctx.accounts.warehouse_authority.key(), ErrorCode::Unauthorized);
+        require_keys_eq!(ctx.accounts.warehouse.receipt_mint, ctx.accounts.receipt_mint.key(), ErrorCode::ConstraintMismatch);
 
         token::mint_to(
             CpiContext::new_with_signer(
@@ -132,10 +218,14 @@ pub mod tokenized_warehouse_receipts {
             ),
             amount,
         )?;
+        emit!(ReceiptMinted {
+            warehouse: ctx.accounts.warehouse.key(),
+            to: ctx.accounts.to_receipt_ata.owner,
+            amount,
+        });
         Ok(())
     }
 
-    /// Burn receipt tokens when a physical redemption occurs (optional helper).
     pub fn burn_receipt(ctx: Context<BurnReceipt>, amount: u64) -> Result<()> {
         token::burn(
             CpiContext::new(
@@ -147,34 +237,40 @@ pub mod tokenized_warehouse_receipts {
                 },
             ),
             amount,
-        )
+        )?;
+        emit!(ReceiptBurned {
+            owner: ctx.accounts.owner.key(),
+            amount,
+        });
+        Ok(())
     }
 
-    // --- Futures (Deal) lifecycle ---
+    // --- Deal lifecycle ---
     pub fn open_deal(
         ctx: Context<OpenDeal>,
         deal_id: u64,
-        strike_price: u64,        // quote per 1.0 receipt unit, using market.price_exponent decimals
-        qty_receipt_amount: u64,  // amount of receipt tokens (in mint decimals) to settle
+        deal_version: u8,
+        strike_price: u64,        // quote per 1.0 receipt unit
+        qty_receipt_amount: u64,  // in receipt mint decimals
         settle_ts: i64,
-        settlement_kind: SettlementKind,
+        settlement_kind: crate::SettlementKind,
         initial_margin_long: u64,
         initial_margin_short: u64,
     ) -> Result<()> {
         let market = &ctx.accounts.market;
         require!(!market.is_paused, ErrorCode::MarketPaused);
-        require!(
-            settle_ts > Clock::get()?.unix_timestamp,
-            ErrorCode::InvalidSettlementTime
-        );
+        require!(deal_version == DEAL_VERSION, ErrorCode::DealVersionMismatch);
+        require!(settle_ts > Clock::get()?.unix_timestamp, ErrorCode::InvalidSettlementTime);
+        require!(is_allowed_collateral(market, &ctx.accounts.quote_mint.key()), ErrorCode::CollateralNotAllowed);
 
         let deal = &mut ctx.accounts.deal;
         deal.version = VERSION;
+        deal.deal_version = deal_version;
         deal.market = market.key();
         deal.deal_id = deal_id;
         deal.long = ctx.accounts.long.key();
         deal.short = ctx.accounts.short.key();
-        deal.quote_mint = market.quote_mint;
+        deal.quote_mint = ctx.accounts.quote_mint.key();
         deal.receipt_mint = market.receipt_mint;
         deal.strike_price = strike_price;
         deal.price_exponent = market.price_exponent;
@@ -185,12 +281,16 @@ pub mod tokenized_warehouse_receipts {
         deal.short_margin = 0;
         deal.fee_bps = market.fee_bps;
         deal.is_settled = false;
-        // Typed bumps
+        deal.is_frozen = false;
         deal.bump = ctx.bumps.deal;
         deal.vault_bump = ctx.bumps.vault_auth;
 
-        // Create and fund margin vaults
-        // Transfer initial margin from long
+        // Margin checks (dynamic)
+        let snap = MarketSnapshot::from(market);
+        let required = required_initial_margin(&snap, strike_price, qty_receipt_amount);
+        require!(initial_margin_long >= required && initial_margin_short >= required, ErrorCode::InsufficientInitialMargin);
+
+        // Fund margin vaults
         if initial_margin_long > 0 {
             token::transfer(
                 CpiContext::new(
@@ -203,12 +303,8 @@ pub mod tokenized_warehouse_receipts {
                 ),
                 initial_margin_long,
             )?;
-            deal.long_margin = deal
-                .long_margin
-                .checked_add(initial_margin_long)
-                .ok_or(ErrorCode::MathOverflow)?;
+            deal.long_margin = deal.long_margin.checked_add(initial_margin_long).ok_or(ErrorCode::MathOverflow)?;
         }
-        // Transfer initial margin from short
         if initial_margin_short > 0 {
             token::transfer(
                 CpiContext::new(
@@ -221,20 +317,49 @@ pub mod tokenized_warehouse_receipts {
                 ),
                 initial_margin_short,
             )?;
-            deal.short_margin = deal
-                .short_margin
-                .checked_add(initial_margin_short)
-                .ok_or(ErrorCode::MathOverflow)?;
+            deal.short_margin = deal.short_margin.checked_add(initial_margin_short).ok_or(ErrorCode::MathOverflow)?;
         }
 
+        emit!(DealOpened {
+            market: market.key(),
+            deal: deal.key(),
+            deal_id,
+            long: deal.long,
+            short: deal.short,
+            quote_mint: deal.quote_mint,
+            receipt_mint: deal.receipt_mint,
+            strike_price,
+            qty_receipt_amount,
+            settle_ts,
+            kind: deal.settlement_kind,
+            fee_bps: deal.fee_bps,
+        });
         Ok(())
     }
 
-    pub fn deposit_margin(ctx: Context<DepositMargin>, side: Side, amount: u64) -> Result<()> {
+    pub fn freeze_deal(ctx: Context<AdminDealWrite>) -> Result<()> {
+        only_admin(&ctx.accounts.market, &ctx.accounts.signer)?;
+        let d = &mut ctx.accounts.deal;
+        d.is_frozen = true;
+        emit!(DealFrozen { deal: d.key() });
+        Ok(())
+    }
+
+    pub fn unfreeze_deal(ctx: Context<AdminDealWrite>) -> Result<()> {
+        only_admin(&ctx.accounts.market, &ctx.accounts.signer)?;
+        let d = &mut ctx.accounts.deal;
+        d.is_frozen = false;
+        emit!(DealUnfrozen { deal: d.key() });
+        Ok(())
+    }
+
+    pub fn deposit_margin(ctx: Context<DepositMargin>, side: crate::Side, amount: u64) -> Result<()> {
         require!(amount > 0, ErrorCode::ZeroAmount);
         let deal = &mut ctx.accounts.deal;
+        require!(!deal.is_frozen, ErrorCode::DealFrozen);
+
         match side {
-            Side::Long => {
+            crate::Side::Long => {
                 require_keys_eq!(deal.long, ctx.accounts.payer.key(), ErrorCode::Unauthorized);
                 token::transfer(
                     CpiContext::new(
@@ -248,8 +373,9 @@ pub mod tokenized_warehouse_receipts {
                     amount,
                 )?;
                 deal.long_margin = deal.long_margin.checked_add(amount).ok_or(ErrorCode::MathOverflow)?;
+                emit!(MarginDeposited { deal: deal.key(), side: 0, amount });
             }
-            Side::Short => {
+            crate::Side::Short => {
                 require_keys_eq!(deal.short, ctx.accounts.payer.key(), ErrorCode::Unauthorized);
                 token::transfer(
                     CpiContext::new(
@@ -263,177 +389,202 @@ pub mod tokenized_warehouse_receipts {
                     amount,
                 )?;
                 deal.short_margin = deal.short_margin.checked_add(amount).ok_or(ErrorCode::MathOverflow)?;
+                emit!(MarginDeposited { deal: deal.key(), side: 1, amount });
             }
         }
         Ok(())
     }
 
-    /// Cash settlement based on market.last_price. Transfers PnL in quote tokens.
-    pub fn settle_cash(ctx: Context<SettleCash>) -> Result<()> {
-        // Manual equality checks
-        require_keys_eq!(
-            ctx.accounts.deal.market,
-            ctx.accounts.market.key(),
-            ErrorCode::ConstraintMismatch
-        );
-        require_keys_eq!(
-            ctx.accounts.market.quote_mint,
-            ctx.accounts.quote_mint.key(),
-            ErrorCode::ConstraintMismatch
-        );
-        require_keys_eq!(
-            ctx.accounts.market.receipt_mint,
-            ctx.accounts.receipt_mint.key(),
-            ErrorCode::ConstraintMismatch
-        );
-        require_keys_eq!(
-            ctx.accounts.deal.quote_mint,
-            ctx.accounts.quote_mint.key(),
-            ErrorCode::ConstraintMismatch
-        );
-        require_keys_eq!(
-            ctx.accounts.deal.receipt_mint,
-            ctx.accounts.receipt_mint.key(),
-            ErrorCode::ConstraintMismatch
-        );
+    /// Cross-Margin: create a per-(market, owner, quote_mint) vault (PDA) to share margin across deals.
+    pub fn cm_create(ctx: Context<CmCreate>) -> Result<()> {
+        let cm = &mut ctx.accounts.cross_margin;
+        cm.market = ctx.accounts.market.key();
+        cm.owner = ctx.accounts.owner.key();
+        cm.quote_mint = ctx.accounts.quote_mint.key();
+        cm.vault_bump = ctx.bumps.cm_vault_auth;
+        emit!(CrossMarginCreated {
+            market: cm.market,
+            owner: cm.owner,
+            quote_mint: cm.quote_mint,
+            vault: ctx.accounts.cm_vault_ata.key()
+        });
+        Ok(())
+    }
 
-        let market = &ctx.accounts.market;
+    /// Deposit to cross-margin vault
+    pub fn cm_deposit(ctx: Context<CmDeposit>, amount: u64) -> Result<()> {
+        require!(amount > 0, ErrorCode::ZeroAmount);
+        token::transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.owner_quote_ata.to_account_info(),
+                    to: ctx.accounts.cm_vault_ata.to_account_info(),
+                    authority: ctx.accounts.owner.to_account_info(),
+                },
+            ),
+            amount,
+        )?;
+        emit!(CrossMarginDeposited {
+            market: ctx.accounts.cross_margin.market,
+            owner: ctx.accounts.owner.key(),
+            amount
+        });
+        Ok(())
+    }
+
+    /// Withdraw from cross-margin vault
+    pub fn cm_withdraw(ctx: Context<CmWithdraw>, amount: u64) -> Result<()> {
+        require!(amount > 0, ErrorCode::ZeroAmount);
+        transfer_signed(
+            &ctx.accounts.token_program,
+            &ctx.accounts.cm_vault_ata,
+            &ctx.accounts.owner_quote_ata,
+            &ctx.accounts.cm_vault_auth,
+            &ctx.accounts.cross_margin.key(),
+            ctx.accounts.cross_margin.vault_bump,
+            amount,
+        )?;
+        emit!(CrossMarginWithdrawn {
+            market: ctx.accounts.cross_margin.market,
+            owner: ctx.accounts.owner.key(),
+            amount
+        });
+        Ok(())
+    }
+
+    /// Move funds from Cross-Margin vault into a specific deal's margin vault (for either side).
+    pub fn cm_move_to_deal(ctx: Context<CmMoveToDeal>, side: crate::Side, amount: u64) -> Result<()> {
+        require!(amount > 0, ErrorCode::ZeroAmount);
         let deal = &mut ctx.accounts.deal;
-        require!(!deal.is_settled, ErrorCode::AlreadySettled);
-        require!(
-            deal.settlement_kind == SettlementKind::Cash as u8,
-            ErrorCode::WrongSettlementKind
-        );
+        require!(deal.quote_mint == ctx.accounts.cross_margin.quote_mint, ErrorCode::ConstraintMismatch);
+        require_keys_eq!(deal.market, ctx.accounts.market.key(), ErrorCode::ConstraintMismatch);
+        require!(!deal.is_frozen, ErrorCode::DealFrozen);
+
+        match side {
+            crate::Side::Long => require_keys_eq!(deal.long, ctx.accounts.owner.key(), ErrorCode::Unauthorized),
+            crate::Side::Short => require_keys_eq!(deal.short, ctx.accounts.owner.key(), ErrorCode::Unauthorized),
+        }
+
+        let dst = match side {
+            crate::Side::Long => &ctx.accounts.long_margin_vault,
+            crate::Side::Short => &ctx.accounts.short_margin_vault,
+        };
+
+        transfer_signed(
+            &ctx.accounts.token_program,
+            &ctx.accounts.cm_vault_ata,
+            dst,
+            &ctx.accounts.cm_vault_auth,
+            &ctx.accounts.cross_margin.key(),
+            ctx.accounts.cross_margin.vault_bump,
+            amount,
+        )?;
+
+        match side {
+            crate::Side::Long => deal.long_margin = deal.long_margin.checked_add(amount).ok_or(ErrorCode::MathOverflow)?,
+            crate::Side::Short => deal.short_margin = deal.short_margin.checked_add(amount).ok_or(ErrorCode::MathOverflow)?,
+        }
+
+        emit!(CrossMarginToDeal {
+            deal: deal.key(),
+            side: if matches!(side, crate::Side::Long) { 0 } else { 1 },
+            amount
+        });
+        Ok(())
+    }
+
+    /// Move funds back from deal-specific margin vault to cross-margin vault.
+    pub fn cm_move_from_deal(ctx: Context<CmMoveFromDeal>, side: crate::Side, amount: u64) -> Result<()> {
+        require!(amount > 0, ErrorCode::ZeroAmount);
+        let deal = &mut ctx.accounts.deal;
+        require!(!deal.is_frozen, ErrorCode::DealFrozen);
+        match side {
+            crate::Side::Long => require_keys_eq!(deal.long, ctx.accounts.owner.key(), ErrorCode::Unauthorized),
+            crate::Side::Short => require_keys_eq!(deal.short, ctx.accounts.owner.key(), ErrorCode::Unauthorized),
+        }
+
+        let src = match side {
+            crate::Side::Long => &ctx.accounts.long_margin_vault,
+            crate::Side::Short => &ctx.accounts.short_margin_vault,
+        };
+
+        transfer_signed(
+            &ctx.accounts.token_program,
+            src,
+            &ctx.accounts.cm_vault_ata,
+            &ctx.accounts.vault_auth,
+            &deal.key(),
+            deal.vault_bump,
+            amount,
+        )?;
+
+        match side {
+            crate::Side::Long => deal.long_margin = deal.long_margin.checked_sub(amount).ok_or(ErrorCode::MathOverflow)?,
+            crate::Side::Short => deal.short_margin = deal.short_margin.checked_sub(amount).ok_or(ErrorCode::MathOverflow)?,
+        }
+
+        emit!(DealToCrossMargin {
+            deal: deal.key(),
+            side: if matches!(side, crate::Side::Long) { 0 } else { 1 },
+            amount
+        });
+        Ok(())
+    }
+
+    /// Cash settlement (full).
+    pub fn settle_cash(ctx: Context<SettleCash>) -> Result<()> {
+        require_keys_eq!(ctx.accounts.deal.market, ctx.accounts.market.key(), ErrorCode::ConstraintMismatch);
+        let market = &ctx.accounts.market;
+        require!(!ctx.accounts.deal.is_frozen, ErrorCode::DealFrozen);
+        require!(!ctx.accounts.deal.is_settled, ErrorCode::AlreadySettled);
+        require!(ctx.accounts.deal.settlement_kind == crate::SettlementKind::Cash as u8, ErrorCode::WrongSettlementKind);
         let now = Clock::get()?.unix_timestamp;
-        require!(now >= deal.settle_ts, ErrorCode::TooEarlyToSettle);
+        require!(now >= ctx.accounts.deal.settle_ts, ErrorCode::TooEarlyToSettle);
         require!(market.last_price > 0, ErrorCode::NoSettlementPrice);
 
-        let strike = deal.strike_price as i128;
-        let final_price = market.last_price as i128;
-        let qty = deal.qty_receipt_amount as i128;
-        // price * qty / 10^abs(exponent)
-        let pnl_long: i128 =
-            (final_price - strike) * qty / int_pow10_i128(deal.price_exponent.abs() as u32);
+        // Immutable snapshots first (no mutable deal borrow yet)
+        let ds = DealSnapshot::from(&ctx.accounts.deal);
+        let ms = MarketSnapshot::from(market);
 
-        // Cache deal key & bump to avoid borrow checker conflicts
-        let deal_key = deal.key();
-        let vault_bump = deal.vault_bump;
+        let pnl_long = calc_pnl_long(&ds, &ms, ds.qty_receipt_amount);
 
-        // Apply fee on winner's payout
-        let fee_bps = deal.fee_bps as i128;
-        if pnl_long > 0 {
-            let fee = pnl_long * fee_bps / BPS_DENOMINATOR as i128;
-            let amount = (pnl_long - fee) as u64;
-            transfer_signed(
-                &ctx.accounts.token_program,
-                &ctx.accounts.short_margin_vault,
-                &ctx.accounts.long_receive_quote_ata,
-                &ctx.accounts.vault_auth,
-                &deal_key,
-                vault_bump,
-                amount,
-            )?;
-            if fee > 0 {
-                transfer_signed(
-                    &ctx.accounts.token_program,
-                    &ctx.accounts.short_margin_vault,
-                    &ctx.accounts.fee_vault,
-                    &ctx.accounts.vault_auth,
-                    &deal_key,
-                    vault_bump,
-                    fee as u64,
-                )?;
-            }
-        } else if pnl_long < 0 {
-            let pnl_short = -pnl_long;
-            let fee = pnl_short * fee_bps / BPS_DENOMINATOR as i128;
-            let amount = (pnl_short - fee) as u64;
-            transfer_signed(
-                &ctx.accounts.token_program,
-                &ctx.accounts.long_margin_vault,
-                &ctx.accounts.short_receive_quote_ata,
-                &ctx.accounts.vault_auth,
-                &deal_key,
-                vault_bump,
-                amount,
-            )?;
-            if fee > 0 {
-                transfer_signed(
-                    &ctx.accounts.token_program,
-                    &ctx.accounts.long_margin_vault,
-                    &ctx.accounts.fee_vault,
-                    &ctx.accounts.vault_auth,
-                    &deal_key,
-                    vault_bump,
-                    fee as u64,
-                )?;
-            }
-        }
+        // Call helper without borrowing the whole Context
+        settle_cash_inner(
+            &ctx.accounts.token_program,
+            &ctx.accounts.short_margin_vault,
+            &ctx.accounts.long_margin_vault,
+            &ctx.accounts.long_receive_quote_ata,
+            &ctx.accounts.short_receive_quote_ata,
+            &ctx.accounts.fee_vault,
+            &ctx.accounts.vault_auth,
+            &ds,
+            pnl_long,
+        )?;
 
-        // Return remaining margins to parties
-        let long_remaining = ctx.accounts.long_margin_vault.amount;
-        if long_remaining > 0 {
-            transfer_signed(
-                &ctx.accounts.token_program,
-                &ctx.accounts.long_margin_vault,
-                &ctx.accounts.long_receive_quote_ata,
-                &ctx.accounts.vault_auth,
-                &deal_key,
-                vault_bump,
-                long_remaining,
-            )?;
-        }
-        let short_remaining = ctx.accounts.short_margin_vault.amount;
-        if short_remaining > 0 {
-            transfer_signed(
-                &ctx.accounts.token_program,
-                &ctx.accounts.short_margin_vault,
-                &ctx.accounts.short_receive_quote_ata,
-                &ctx.accounts.vault_auth,
-                &deal_key,
-                vault_bump,
-                short_remaining,
-            )?;
-        }
+        // Now mutate the deal
+        let deal_mut = &mut ctx.accounts.deal;
+        deal_mut.is_settled = true;
 
-        deal.is_settled = true;
+        emit!(CashSettled {
+            deal: ds.deal,
+            final_price: ms.last_price,
+            pnl_long,
+        });
         Ok(())
     }
 
-    /// Physical settlement: short delivers receipt tokens to long, and receives
-    /// strike * qty in quote tokens from long's margin vault.
+    /// Physical settlement (full).
     pub fn settle_physical(ctx: Context<SettlePhysical>) -> Result<()> {
-        // Manual equality checks
-        require_keys_eq!(
-            ctx.accounts.deal.quote_mint,
-            ctx.accounts.quote_mint.key(),
-            ErrorCode::ConstraintMismatch
-        );
-        require_keys_eq!(
-            ctx.accounts.deal.receipt_mint,
-            ctx.accounts.receipt_mint.key(),
-            ErrorCode::ConstraintMismatch
-        );
-        require_keys_eq!(
-            ctx.accounts.deal.market,
-            ctx.accounts.market.key(),
-            ErrorCode::ConstraintMismatch
-        );
-
         let deal = &mut ctx.accounts.deal;
+        require!(!deal.is_frozen, ErrorCode::DealFrozen);
         require!(!deal.is_settled, ErrorCode::AlreadySettled);
-        require!(
-            deal.settlement_kind == SettlementKind::Physical as u8,
-            ErrorCode::WrongSettlementKind
-        );
+        require!(deal.settlement_kind == crate::SettlementKind::Physical as u8, ErrorCode::WrongSettlementKind);
         let now = Clock::get()?.unix_timestamp;
         require!(now >= deal.settle_ts, ErrorCode::TooEarlyToSettle);
 
-        // Cache key & bump before any transfers
-        let deal_key = deal.key();
-        let vault_bump = deal.vault_bump;
+        let ds = DealSnapshot::from(deal);
 
-        // Transfer receipts from short -> long
         token::transfer(
             CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
@@ -443,53 +594,126 @@ pub mod tokenized_warehouse_receipts {
                     authority: ctx.accounts.short.to_account_info(),
                 },
             ),
-            deal.qty_receipt_amount,
+            ds.qty_receipt_amount,
         )?;
 
-        // Pay short from long margin at strike
-        let pay_amount = mul_div_u128(
-            deal.strike_price as u128,
-            deal.qty_receipt_amount as u128,
-            pow10_u128(deal.price_exponent.abs() as u32),
-        ) as u64;
-
+        let pay_amount = notional_at_strike(&ds);
         transfer_signed(
             &ctx.accounts.token_program,
             &ctx.accounts.long_margin_vault,
             &ctx.accounts.short_receive_quote_ata,
             &ctx.accounts.vault_auth,
-            &deal_key,
-            vault_bump,
+            &ds.deal,
+            ds.vault_bump,
             pay_amount,
         )?;
 
-        // Return remaining margins
-        let long_remaining = ctx.accounts.long_margin_vault.amount;
-        if long_remaining > 0 {
-            transfer_signed(
-                &ctx.accounts.token_program,
-                &ctx.accounts.long_margin_vault,
-                &ctx.accounts.long_receive_quote_ata,
-                &ctx.accounts.vault_auth,
-                &deal_key,
-                vault_bump,
-                long_remaining,
-            )?;
-        }
-        let short_remaining = ctx.accounts.short_margin_vault.amount;
-        if short_remaining > 0 {
-            transfer_signed(
-                &ctx.accounts.token_program,
-                &ctx.accounts.short_margin_vault,
-                &ctx.accounts.short_receive_quote_ata,
-                &ctx.accounts.vault_auth,
-                &deal_key,
-                vault_bump,
-                short_remaining,
-            )?;
-        }
+        payout_leftovers_after_settlement(&ctx.accounts.token_program, &ctx.accounts.long_margin_vault, &ctx.accounts.long_receive_quote_ata, &ctx.accounts.vault_auth, &ds)?;
+        payout_leftovers_after_settlement(&ctx.accounts.token_program, &ctx.accounts.short_margin_vault, &ctx.accounts.short_receive_quote_ata, &ctx.accounts.vault_auth, &ds)?;
 
         deal.is_settled = true;
+        emit!(PhysicalSettled {
+            deal: ds.deal,
+            qty_receipt_amount: ds.qty_receipt_amount,
+            pay_amount,
+        });
+        Ok(())
+    }
+
+    /// Partial physical settlement by `amount_receipt` (<= remaining).
+    pub fn settle_partial_physical(ctx: Context<SettlePhysical>, amount_receipt: u64) -> Result<()> {
+        let deal = &mut ctx.accounts.deal;
+        require!(!deal.is_frozen, ErrorCode::DealFrozen);
+        require!(!deal.is_settled, ErrorCode::AlreadySettled);
+        require!(deal.settlement_kind == crate::SettlementKind::Physical as u8, ErrorCode::WrongSettlementKind);
+        let now = Clock::get()?.unix_timestamp;
+        require!(now >= deal.settle_ts, ErrorCode::TooEarlyToSettle);
+        require!(amount_receipt > 0 && amount_receipt <= deal.qty_receipt_amount, ErrorCode::InvalidPartialAmount);
+
+        let mut ds = DealSnapshot::from(deal);
+        ds.qty_receipt_amount = amount_receipt;
+
+        token::transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.short_receipt_ata.to_account_info(),
+                    to: ctx.accounts.long_receipt_ata.to_account_info(),
+                    authority: ctx.accounts.short.to_account_info(),
+                },
+            ),
+            amount_receipt,
+        )?;
+
+        let pay_amount = notional_at_strike(&ds);
+        transfer_signed(
+            &ctx.accounts.token_program,
+            &ctx.accounts.long_margin_vault,
+            &ctx.accounts.short_receive_quote_ata,
+            &ctx.accounts.vault_auth,
+            &ds.deal,
+            ds.vault_bump,
+            pay_amount,
+        )?;
+
+        deal.qty_receipt_amount = deal.qty_receipt_amount.checked_sub(amount_receipt).ok_or(ErrorCode::MathOverflow)?;
+        let is_now_settled = deal.qty_receipt_amount == 0;
+        deal.is_settled = is_now_settled;
+
+        emit!(PartialPhysicalSettled {
+            deal: ds.deal,
+            amount_receipt,
+            pay_amount,
+            fully_settled: is_now_settled,
+        });
+        Ok(())
+    }
+
+    // --- Yield (POC) ---
+    pub fn yield_set_operator(ctx: Context<AdminMarketWrite>, operator: Pubkey) -> Result<()> {
+        only_admin(&ctx.accounts.market, &ctx.accounts.signer)?;
+        ctx.accounts.market.strategy_operator = operator;
+        emit!(YieldOperatorSet { market: ctx.accounts.market.key(), operator });
+        Ok(())
+    }
+
+    pub fn yield_park_from_deal(ctx: Context<YieldPark>, side: crate::Side, amount: u64) -> Result<()> {
+        only_strategy_operator(&ctx.accounts.market, &ctx.accounts.operator)?;
+        let deal = &ctx.accounts.deal;
+        let src = match side {
+            crate::Side::Long => &ctx.accounts.long_margin_vault,
+            crate::Side::Short => &ctx.accounts.short_margin_vault,
+        };
+        transfer_signed(
+            &ctx.accounts.token_program,
+            src,
+            &ctx.accounts.strategy_vault_ata,
+            &ctx.accounts.vault_auth,
+            &deal.key(),
+            deal.vault_bump,
+            amount,
+        )?;
+        emit!(YieldParked { deal: deal.key(), side: if matches!(side, crate::Side::Long) {0} else {1}, amount });
+        Ok(())
+    }
+
+    pub fn yield_unpark_to_deal(ctx: Context<YieldPark>, side: crate::Side, amount: u64) -> Result<()> {
+        only_strategy_operator(&ctx.accounts.market, &ctx.accounts.operator)?;
+        let deal = &ctx.accounts.deal;
+        let dst = match side {
+            crate::Side::Long => &ctx.accounts.long_margin_vault,
+            crate::Side::Short => &ctx.accounts.short_margin_vault,
+        };
+        transfer_signed(
+            &ctx.accounts.token_program,
+            &ctx.accounts.strategy_vault_ata,
+            dst,
+            &ctx.accounts.vault_auth,
+            &deal.key(),
+            deal.vault_bump,
+            amount,
+        )?;
+        emit!(YieldUnparked { deal: deal.key(), side: if matches!(side, crate::Side::Long) {0} else {1}, amount });
         Ok(())
     }
 }
@@ -502,7 +726,7 @@ pub struct InitMarket<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
     pub quote_mint: Box<Account<'info, Mint>>,    // e.g., USDC
-    pub receipt_mint: Box<Account<'info, Mint>>,  // commodity receipt SPL mint
+    pub receipt_mint: Box<Account<'info, Mint>>,  // tokenized receipt SPL mint
     #[account(
         init,
         payer = authority,
@@ -515,13 +739,19 @@ pub struct InitMarket<'info> {
 }
 
 #[derive(Accounts)]
+pub struct AdminMarketWrite<'info> {
+    #[account(mut)]
+    pub signer: Signer<'info>,
+    #[account(mut)]
+    pub market: Account<'info, Market>,
+}
+
+#[derive(Accounts)]
 pub struct PostPrice<'info> {
     #[account(mut)]
     pub market: Account<'info, Market>,
     /// CHECK: authority check done in handler
     pub poster: Signer<'info>,
-    pub quote_mint: Box<Account<'info, Mint>>,   // same as market
-    pub receipt_mint: Box<Account<'info, Mint>>, // same as market
 }
 
 #[derive(Accounts)]
@@ -665,6 +895,15 @@ pub struct OpenDeal<'info> {
 }
 
 #[derive(Accounts)]
+pub struct AdminDealWrite<'info> {
+    pub signer: Signer<'info>,
+    #[account(mut)]
+    pub market: Account<'info, Market>,
+    #[account(mut)]
+    pub deal: Account<'info, Deal>,
+}
+
+#[derive(Accounts)]
 pub struct DepositMargin<'info> {
     #[account(mut)]
     pub deal: Account<'info, Deal>,
@@ -784,6 +1023,195 @@ pub struct SettlePhysical<'info> {
     pub associated_token_program: Program<'info, AssociatedToken>,
 }
 
+#[derive(Accounts)]
+pub struct CmCreate<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    pub market: Account<'info, Market>,
+    pub quote_mint: Box<Account<'info, Mint>>,
+
+    #[account(
+        init,
+        payer = owner,
+        space = 8 + CrossMargin::SIZE,
+        seeds = [b"cross_margin", market.key().as_ref(), owner.key().as_ref(), quote_mint.key().as_ref()],
+        bump
+    )]
+    pub cross_margin: Account<'info, CrossMargin>,
+
+    /// CHECK: PDA authority for CM vault ATA
+    #[account(
+        seeds = [b"cm_vault_auth", cross_margin.key().as_ref()],
+        bump
+    )]
+    pub cm_vault_auth: UncheckedAccount<'info>,
+
+    #[account(
+        init,
+        payer = owner,
+        associated_token::mint = quote_mint,
+        associated_token::authority = cm_vault_auth,
+    )]
+    pub cm_vault_ata: Box<Account<'info, TokenAccount>>,
+
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct CmDeposit<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    pub market: Account<'info, Market>,
+    pub quote_mint: Box<Account<'info, Mint>>,
+    #[account(mut, has_one = market, has_one = quote_mint)]
+    pub cross_margin: Account<'info, CrossMargin>,
+    /// CHECK: PDA authority for CM vault
+    #[account(
+        seeds = [b"cm_vault_auth", cross_margin.key().as_ref()],
+        bump = cross_margin.vault_bump
+    )]
+    pub cm_vault_auth: UncheckedAccount<'info>,
+    #[account(mut, associated_token::mint = quote_mint, associated_token::authority = cm_vault_auth)]
+    pub cm_vault_ata: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        constraint = owner_quote_ata.owner == owner.key(),
+        constraint = owner_quote_ata.mint == quote_mint.key()
+    )]
+    pub owner_quote_ata: Box<Account<'info, TokenAccount>>,
+
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+}
+
+#[derive(Accounts)]
+pub struct CmWithdraw<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    pub market: Account<'info, Market>,
+    pub quote_mint: Box<Account<'info, Mint>>,
+    #[account(mut, has_one = market, has_one = quote_mint)]
+    pub cross_margin: Account<'info, CrossMargin>,
+    /// CHECK
+    #[account(
+        seeds = [b"cm_vault_auth", cross_margin.key().as_ref()],
+        bump = cross_margin.vault_bump
+    )]
+    pub cm_vault_auth: UncheckedAccount<'info>,
+    #[account(mut, associated_token::mint = quote_mint, associated_token::authority = cm_vault_auth)]
+    pub cm_vault_ata: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        constraint = owner_quote_ata.owner == owner.key(),
+        constraint = owner_quote_ata.mint == quote_mint.key()
+    )]
+    pub owner_quote_ata: Box<Account<'info, TokenAccount>>,
+
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+}
+
+#[derive(Accounts)]
+pub struct CmMoveToDeal<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    pub market: Account<'info, Market>,
+    pub quote_mint: Box<Account<'info, Mint>>,
+    #[account(mut)]
+    pub deal: Account<'info, Deal>,
+    #[account(
+        seeds = [b"vault_auth", deal.key().as_ref()],
+        bump = deal.vault_bump
+    )]
+    /// CHECK
+    pub vault_auth: UncheckedAccount<'info>,
+
+    #[account(mut, has_one = market, has_one = quote_mint)]
+    pub cross_margin: Account<'info, CrossMargin>,
+    /// CHECK
+    #[account(
+        seeds = [b"cm_vault_auth", cross_margin.key().as_ref()],
+        bump = cross_margin.vault_bump
+    )]
+    pub cm_vault_auth: UncheckedAccount<'info>,
+    #[account(mut, associated_token::mint = quote_mint, associated_token::authority = cm_vault_auth)]
+    pub cm_vault_ata: Box<Account<'info, TokenAccount>>,
+
+    #[account(mut, associated_token::mint = quote_mint, associated_token::authority = vault_auth)]
+    pub long_margin_vault: Box<Account<'info, TokenAccount>>,
+    #[account(mut, associated_token::mint = quote_mint, associated_token::authority = vault_auth)]
+    pub short_margin_vault: Box<Account<'info, TokenAccount>>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct CmMoveFromDeal<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    pub market: Account<'info, Market>,
+    pub quote_mint: Box<Account<'info, Mint>>,
+    #[account(mut)]
+    pub deal: Account<'info, Deal>,
+    /// CHECK
+    #[account(
+        seeds = [b"vault_auth", deal.key().as_ref()],
+        bump = deal.vault_bump
+    )]
+    pub vault_auth: UncheckedAccount<'info>,
+
+    #[account(mut, has_one = market, has_one = quote_mint)]
+    pub cross_margin: Account<'info, CrossMargin>,
+    /// CHECK
+    #[account(
+        seeds = [b"cm_vault_auth", cross_margin.key().as_ref()],
+        bump = cross_margin.vault_bump
+    )]
+    pub cm_vault_auth: UncheckedAccount<'info>,
+    #[account(mut, associated_token::mint = quote_mint, associated_token::authority = cm_vault_auth)]
+    pub cm_vault_ata: Box<Account<'info, TokenAccount>>,
+
+    #[account(mut, associated_token::mint = quote_mint, associated_token::authority = vault_auth)]
+    pub long_margin_vault: Box<Account<'info, TokenAccount>>,
+    #[account(mut, associated_token::mint = quote_mint, associated_token::authority = vault_auth)]
+    pub short_margin_vault: Box<Account<'info, TokenAccount>>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct YieldPark<'info> {
+    pub operator: Signer<'info>,
+    #[account(mut)]
+    pub market: Account<'info, Market>,
+    #[account(mut)]
+    pub deal: Account<'info, Deal>,
+    /// CHECK
+    #[account(
+        seeds = [b"vault_auth", deal.key().as_ref()],
+        bump = deal.vault_bump
+    )]
+    pub vault_auth: UncheckedAccount<'info>,
+
+    pub quote_mint: Box<Account<'info, Mint>>,
+
+    // deal margin vaults
+    #[account(mut, associated_token::mint = quote_mint, associated_token::authority = vault_auth)]
+    pub long_margin_vault: Box<Account<'info, TokenAccount>>,
+    #[account(mut, associated_token::mint = quote_mint, associated_token::authority = vault_auth)]
+    pub short_margin_vault: Box<Account<'info, TokenAccount>>,
+
+    // strategy vault (same authority PDA for simplicity)
+    #[account(mut, associated_token::mint = quote_mint, associated_token::authority = vault_auth)]
+    pub strategy_vault_ata: Box<Account<'info, TokenAccount>>,
+
+    pub token_program: Program<'info, Token>,
+}
+
 // ==========
 // State
 // ==========
@@ -791,40 +1219,51 @@ pub struct SettlePhysical<'info> {
 pub struct Market {
     pub version: u8,
     pub authority: Pubkey,
+    pub governance_authority: Pubkey,
     pub quote_mint: Pubkey,
     pub receipt_mint: Pubkey,
     pub oracle_authority: Pubkey,
     pub fee_bps: u16,
     pub is_paused: bool,
-    pub last_price: u64,    // e.g., 123_456_789 with exponent -6 => 123456.789 quote per unit
+    pub last_price: u64,     // e.g., 123_456_789 with exponent -6 => 123456.789 quote per unit
     pub price_exponent: i32, // typically -6 for USDC-like decimals
     pub settle_ts: i64,
+    // Dynamic margining
+    pub base_initial_margin_bps: u16,
+    pub maintenance_margin_bps: u16,
+    pub vol_multiplier_bps: u16,
+    pub last_vol_bps: u16,
+    // Multi-collateral
+    pub allowed_collaterals: [Pubkey; MAX_COLLATERALS],
+    pub allowed_count: u8,
+    // Strategy operator for yield POC
+    pub strategy_operator: Pubkey,
 }
 impl Market {
-    pub const SIZE: usize = 1 + 32 + 32 + 32 + 32 + 2 + 1 + 8 + 4 + 8;
+    pub const SIZE: usize =
+        1 + 32 + 32 + 32 + 32 + 32 + 2 + 1 + 8 + 4 + 8 + 2 + 2 + 2 + 2 + (32 * MAX_COLLATERALS) + 1 + 32;
 }
 
 #[account]
 pub struct Warehouse {
     pub market: Pubkey,
-    pub authority: Pubkey,       // certified warehouse signer
+    pub authority: Pubkey,        // certified warehouse signer
     pub receipt_mint: Pubkey,
-    pub bump: u8,                // for receipt_mint_auth PDA
+    pub bump: u8,                 // for receipt_mint_auth PDA
 }
-impl Warehouse {
-    pub const SIZE: usize = 32 + 32 + 32 + 1;
-}
+impl Warehouse { pub const SIZE: usize = 32 + 32 + 32 + 1; }
 
 #[account]
 pub struct Deal {
     pub version: u8,
+    pub deal_version: u8,
     pub market: Pubkey,
     pub deal_id: u64,
     pub long: Pubkey,
     pub short: Pubkey,
     pub quote_mint: Pubkey,
     pub receipt_mint: Pubkey,
-    pub strike_price: u64,      // price with exponent
+    pub strike_price: u64,       // price with exponent
     pub price_exponent: i32,
     pub qty_receipt_amount: u64, // in receipt mint decimals
     pub settle_ts: i64,
@@ -833,47 +1272,201 @@ pub struct Deal {
     pub short_margin: u64,
     pub fee_bps: u16,
     pub is_settled: bool,
+    pub is_frozen: bool,
     pub bump: u8,        // deal PDA bump
     pub vault_bump: u8,  // vault_auth PDA bump
 }
 impl Deal {
     pub const SIZE: usize =
-        1 + 32 + 8 + 32 + 32 + 32 + 32 + 8 + 4 + 8 + 8 + 1 + 8 + 8 + 2 + 1 + 1 + 1;
+        1 + 1 + 32 + 8 + 32 + 32 + 32 + 32 + 8 + 4 + 8 + 8 + 1 + 8 + 8 + 2 + 1 + 1 + 1 + 1;
+}
+
+#[account]
+pub struct CrossMargin {
+    pub market: Pubkey,
+    pub owner: Pubkey,
+    pub quote_mint: Pubkey,
+    pub vault_bump: u8,
+}
+impl CrossMargin {
+    pub const SIZE: usize = 32 + 32 + 32 + 1;
 }
 
 // ==========
-// Enums & Helpers
+// Events
 // ==========
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq)]
-pub enum SettlementKind {
-    Cash = 0,
-    Physical = 1,
+#[event]
+pub struct MarketInitialized {
+    pub market: Pubkey,
+    pub authority: Pubkey,
+    pub governance_authority: Pubkey,
+    pub quote_mint: Pubkey,
+    pub receipt_mint: Pubkey,
+    pub fee_bps: u16,
+}
+#[event] pub struct MarketPaused { pub market: Pubkey }
+#[event] pub struct MarketUnpaused { pub market: Pubkey }
+#[event] pub struct PricePosted { pub market: Pubkey, pub price: u64, pub exponent: i32, pub settle_ts: i64, pub vol_bps: u16 }
+#[event] pub struct CollateralAdded { pub market: Pubkey, pub collateral_mint: Pubkey }
+#[event] pub struct CollateralRemoved { pub market: Pubkey, pub collateral_mint: Pubkey }
+
+#[event] pub struct WarehouseInitialized { pub market: Pubkey, pub warehouse: Pubkey, pub warehouse_authority: Pubkey, pub receipt_mint: Pubkey }
+#[event] pub struct ReceiptMinted { pub warehouse: Pubkey, pub to: Pubkey, pub amount: u64 }
+#[event] pub struct ReceiptBurned { pub owner: Pubkey, pub amount: u64 }
+
+#[event]
+pub struct DealOpened {
+    pub market: Pubkey,
+    pub deal: Pubkey,
+    pub deal_id: u64,
+    pub long: Pubkey,
+    pub short: Pubkey,
+    pub quote_mint: Pubkey,
+    pub receipt_mint: Pubkey,
+    pub strike_price: u64,
+    pub qty_receipt_amount: u64,
+    pub settle_ts: i64,
+    pub kind: u8,
+    pub fee_bps: u16,
 }
 
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq)]
-pub enum Side {
-    Long,
-    Short,
+#[event] pub struct DealFrozen { pub deal: Pubkey }
+#[event] pub struct DealUnfrozen { pub deal: Pubkey }
+
+#[event] pub struct MarginDeposited { pub deal: Pubkey, pub side: u8, pub amount: u64 }
+#[event] pub struct CashSettled { pub deal: Pubkey, pub final_price: u64, pub pnl_long: i128 }
+#[event] pub struct PhysicalSettled { pub deal: Pubkey, pub qty_receipt_amount: u64, pub pay_amount: u64 }
+#[event] pub struct PartialPhysicalSettled { pub deal: Pubkey, pub amount_receipt: u64, pub pay_amount: u64, pub fully_settled: bool }
+
+#[event] pub struct CrossMarginCreated { pub market: Pubkey, pub owner: Pubkey, pub quote_mint: Pubkey, pub vault: Pubkey }
+#[event] pub struct CrossMarginDeposited { pub market: Pubkey, pub owner: Pubkey, pub amount: u64 }
+#[event] pub struct CrossMarginWithdrawn { pub market: Pubkey, pub owner: Pubkey, pub amount: u64 }
+#[event] pub struct CrossMarginToDeal { pub deal: Pubkey, pub side: u8, pub amount: u64 }
+#[event] pub struct DealToCrossMargin { pub deal: Pubkey, pub side: u8, pub amount: u64 }
+
+#[event] pub struct YieldOperatorSet { pub market: Pubkey, pub operator: Pubkey }
+#[event] pub struct YieldParked { pub deal: Pubkey, pub side: u8, pub amount: u64 }
+#[event] pub struct YieldUnparked { pub deal: Pubkey, pub side: u8, pub amount: u64 }
+
+// ==========
+// Snapshots (immutable copies to avoid borrow issues)
+// ==========
+#[derive(Clone, Copy)]
+struct DealSnapshot {
+    pub deal: Pubkey,
+    pub quote_mint: Pubkey,
+    pub receipt_mint: Pubkey,
+    pub strike_price: u64,
+    pub price_exponent: i32,
+    pub qty_receipt_amount: u64,
+    pub fee_bps: u16,
+    pub vault_bump: u8,
+}
+impl DealSnapshot {
+    fn from(d: &Account<Deal>) -> Self {
+        Self {
+            deal: d.key(),
+            quote_mint: d.quote_mint,
+            receipt_mint: d.receipt_mint,
+            strike_price: d.strike_price,
+            price_exponent: d.price_exponent,
+            qty_receipt_amount: d.qty_receipt_amount,
+            fee_bps: d.fee_bps,
+            vault_bump: d.vault_bump,
+        }
+    }
 }
 
-// Math helpers
-fn pow10_u128(p: u32) -> u128 {
-    (10u128).pow(p)
+#[derive(Clone, Copy)]
+struct MarketSnapshot {
+    pub last_price: u64,
+    pub price_exponent: i32,
+    pub base_initial_margin_bps: u16,
+    pub maintenance_margin_bps: u16,
+    pub vol_multiplier_bps: u16,
+    pub last_vol_bps: u16,
 }
-fn mul_div_u128(a: u128, b: u128, div: u128) -> u128 {
-    a.saturating_mul(b) / div
-}
-fn int_pow10_i128(p: u32) -> i128 {
-    (10i128).pow(p)
+impl MarketSnapshot {
+    fn from(m: &Account<Market>) -> Self {
+        Self {
+            last_price: m.last_price,
+            price_exponent: m.price_exponent,
+            base_initial_margin_bps: m.base_initial_margin_bps,
+            maintenance_margin_bps: m.maintenance_margin_bps,
+            vol_multiplier_bps: m.vol_multiplier_bps,
+            last_vol_bps: m.last_vol_bps,
+        }
+    }
 }
 
-// CPI helper with unified lifetime to satisfy Anchor invariance rules.
+// ==========
+// Helpers & Math
+// ==========
+fn only_admin(market: &Market, signer: &Signer) -> Result<()> {
+    require!(
+        signer.key() == market.authority || signer.key() == market.governance_authority,
+        ErrorCode::Unauthorized
+    );
+    Ok(())
+}
+
+fn only_strategy_operator(market: &Market, operator: &Signer) -> Result<()> {
+    require!(operator.key() == market.strategy_operator, ErrorCode::Unauthorized);
+    Ok(())
+}
+
+fn is_allowed_collateral(market: &Market, mint: &Pubkey) -> bool {
+    if *mint == market.quote_mint {
+        return true;
+    }
+    for i in 0..market.allowed_count as usize {
+        if market.allowed_collaterals[i] == *mint {
+            return true;
+        }
+    }
+    false
+}
+
+fn pow10_u128(p: u32) -> u128 { (10u128).pow(p) }
+fn int_pow10_i128(p: u32) -> i128 { (10i128).pow(p) }
+
+fn notional_at_strike(ds: &DealSnapshot) -> u64 {
+    let n = (ds.strike_price as u128)
+        .saturating_mul(ds.qty_receipt_amount as u128)
+        / pow10_u128(ds.price_exponent.abs() as u32);
+    n as u64
+}
+
+fn calc_pnl_long(ds: &DealSnapshot, ms: &MarketSnapshot, qty: u64) -> i128 {
+    let strike = ds.strike_price as i128;
+    let final_price = ms.last_price as i128;
+    let qty_i = qty as i128;
+    (final_price - strike) * qty_i / int_pow10_i128(ds.price_exponent.abs() as u32)
+}
+
+/// Dynamic initial margin requirement:
+fn required_initial_margin(ms: &MarketSnapshot, strike_price: u64, qty: u64) -> u64 {
+    let notional = (strike_price as u128)
+        .saturating_mul(qty as u128)
+        / pow10_u128(ms.price_exponent.abs() as u32);
+
+    let vol_adj_bps = (ms.vol_multiplier_bps as u128)
+        .saturating_mul(ms.last_vol_bps as u128)
+        / (BPS_DENOMINATOR as u128);
+
+    let total_bps = (ms.base_initial_margin_bps as u128)
+        .saturating_add(vol_adj_bps);
+
+    (notional.saturating_mul(total_bps) / (BPS_DENOMINATOR as u128)) as u64
+}
+
+// Transfer using PDA signer (generic lifetime to satisfy invariance)
 fn transfer_signed<'info>(
     token_program: &Program<'info, Token>,
     from: &Account<'info, TokenAccount>,
     to: &Account<'info, TokenAccount>,
     vault_auth: &UncheckedAccount<'info>,
-    deal_key: &Pubkey,
+    seed_key: &Pubkey,
     vault_bump: u8,
     amount: u64,
 ) -> Result<()> {
@@ -885,10 +1478,104 @@ fn transfer_signed<'info>(
                 to: to.to_account_info(),
                 authority: vault_auth.to_account_info(),
             },
-            &[&[b"vault_auth", deal_key.as_ref(), &[vault_bump]]],
+            &[&[b"vault_auth", seed_key.as_ref(), &[vault_bump]]],
         ),
         amount,
     )
+}
+
+// Return remaining funds from a vault to its party after settlement
+fn payout_leftovers_after_settlement<'info>(
+    token_program: &Program<'info, Token>,
+    vault: &Account<'info, TokenAccount>,
+    recipient: &Account<'info, TokenAccount>,
+    vault_auth: &UncheckedAccount<'info>,
+    ds: &DealSnapshot,
+) -> Result<()> {
+    let amt = vault.amount;
+    if amt > 0 {
+        transfer_signed(token_program, vault, recipient, vault_auth, &ds.deal, ds.vault_bump, amt)?;
+    }
+    Ok(())
+}
+
+// Cash settlement internal: moves PnL + fees, then returns leftovers (no &Context borrow).
+fn settle_cash_inner<'info>(
+    token_program: &Program<'info, Token>,
+    short_margin_vault: &Account<'info, TokenAccount>,
+    long_margin_vault: &Account<'info, TokenAccount>,
+    long_receive_quote_ata: &Account<'info, TokenAccount>,
+    short_receive_quote_ata: &Account<'info, TokenAccount>,
+    fee_vault: &Account<'info, TokenAccount>,
+    vault_auth: &UncheckedAccount<'info>,
+    ds: &DealSnapshot,
+    pnl_long: i128,
+) -> Result<()> {
+    let fee_bps = ds.fee_bps as i128;
+    if pnl_long > 0 {
+        let fee = pnl_long * fee_bps / BPS_DENOMINATOR as i128;
+        let amount = (pnl_long - fee) as u64;
+        transfer_signed(
+            token_program,
+            short_margin_vault,
+            long_receive_quote_ata,
+            vault_auth,
+            &ds.deal,
+            ds.vault_bump,
+            amount,
+        )?;
+        if fee > 0 {
+            transfer_signed(
+                token_program,
+                short_margin_vault,
+                fee_vault,
+                vault_auth,
+                &ds.deal,
+                ds.vault_bump,
+                fee as u64,
+            )?;
+        }
+    } else if pnl_long < 0 {
+        let pnl_short = -pnl_long;
+        let fee = pnl_short * fee_bps / BPS_DENOMINATOR as i128;
+        let amount = (pnl_short - fee) as u64;
+        transfer_signed(
+            token_program,
+            long_margin_vault,
+            short_receive_quote_ata,
+            vault_auth,
+            &ds.deal,
+            ds.vault_bump,
+            amount,
+        )?;
+        if fee > 0 {
+            transfer_signed(
+                token_program,
+                long_margin_vault,
+                fee_vault,
+                vault_auth,
+                &ds.deal,
+                ds.vault_bump,
+                fee as u64,
+            )?;
+        }
+    }
+
+    payout_leftovers_after_settlement(
+        token_program,
+        long_margin_vault,
+        long_receive_quote_ata,
+        vault_auth,
+        ds,
+    )?;
+    payout_leftovers_after_settlement(
+        token_program,
+        short_margin_vault,
+        short_receive_quote_ata,
+        vault_auth,
+        ds,
+    )?;
+    Ok(())
 }
 
 // ==========
@@ -896,27 +1583,24 @@ fn transfer_signed<'info>(
 // ==========
 #[error_code]
 pub enum ErrorCode {
-    #[msg("Fee too high")]
-    FeeTooHigh,
-    #[msg("Unauthorized")]
-    Unauthorized,
-    #[msg("Market is paused")]
-    MarketPaused,
-    #[msg("Invalid settlement time")]
-    InvalidSettlementTime,
-    #[msg("Math overflow")]
-    MathOverflow,
-    #[msg("Zero amount not allowed")]
-    ZeroAmount,
-    #[msg("Already settled")]
-    AlreadySettled,
-    #[msg("Wrong settlement kind for this instruction")]
-    WrongSettlementKind,
-    #[msg("Too early to settle")]
-    TooEarlyToSettle,
-    #[msg("No posted settlement price")]
-    NoSettlementPrice,
-    #[msg("Constraint mismatch")]
-    ConstraintMismatch,
+    #[msg("Fee too high")] FeeTooHigh,
+    #[msg("Unauthorized")] Unauthorized,
+    #[msg("Market is paused")] MarketPaused,
+    #[msg("Invalid settlement time")] InvalidSettlementTime,
+    #[msg("Math overflow")] MathOverflow,
+    #[msg("Zero amount not allowed")] ZeroAmount,
+    #[msg("Already settled")] AlreadySettled,
+    #[msg("Wrong settlement kind for this instruction")] WrongSettlementKind,
+    #[msg("Too early to settle")] TooEarlyToSettle,
+    #[msg("No posted settlement price")] NoSettlementPrice,
+    #[msg("Constraint mismatch")] ConstraintMismatch,
+    #[msg("Too many collaterals")] TooManyCollaterals,
+    #[msg("Collateral not found")] CollateralNotFound,
+    #[msg("Collateral mint not allowed")] CollateralNotAllowed,
+    #[msg("Insufficient initial margin")] InsufficientInitialMargin,
+    #[msg("Deal version mismatch")] DealVersionMismatch,
+    #[msg("Deal is frozen")] DealFrozen,
+    #[msg("Invalid partial amount")] InvalidPartialAmount,
 }
+
 
