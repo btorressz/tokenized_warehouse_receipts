@@ -59,4 +59,22 @@ The program is structured around three main lifecycles:
 - **settle_physical 🚚**  
   Physical settlement. The short delivers receipt tokens to the long and receives strike price × quantity in quote tokens. Margins are reconciled afterward.
 
+  ---
+
+
+  #### ***🗂️ State Accounts***
+The program stores information in structured accounts:
+
+- **Market 🏦**  
+  Defines the trading environment: authority, quote mint, receipt mint, oracle authority, fee basis points, settlement parameters.
+
+- **Warehouse 🏭**  
+  Represents a certified warehouse and links it to a market. Holds authority info and PDA bump for minting receipts.
+
+- **Deal 🤝**  
+  Tracks a futures contract: parties (long/short), strike price, receipt amount, settlement kind, settlement timestamp, margins, and settlement status.
+
+---
+
+
 ---
