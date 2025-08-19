@@ -76,5 +76,26 @@ The program stores information in structured accounts:
 
 ---
 
+#### ***🔑 Enums***
+- **SettlementKind**  
+  - Cash (0)  
+  - Physical (1)  
+
+- **Side**  
+  - Long  
+  - Short  
+
+---
+
+#### ***⚖️ Error Handling***
+The program includes safety checks with custom error codes, such as:
+- **FeeTooHigh** (if > 10%)  
+- **Unauthorized** (invalid signer)  
+- **MarketPaused**  
+- **InvalidSettlementTime**  
+- **WrongSettlementKind**  
+- **AlreadySettled**  
+- **NoSettlementPrice**  
+
 
 ---
